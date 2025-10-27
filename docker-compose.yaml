@@ -1,0 +1,8 @@
+services:
+  agent:
+    build: .
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - ./data:/workspace/data
+    command: ["Solve the integral of sin(x) from 0 to pi."]
