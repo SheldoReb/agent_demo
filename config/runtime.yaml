@@ -1,0 +1,8 @@
+# Runtime configuration for the AG2 demo agent.
+runtime:
+  type: openai-chat
+  model: openai/gpt-oss-120b
+  base_url: https://router.huggingface.co/v1
+  api_key: ${HF_TOKEN}
+  temperature: 0.2
+  max_output_tokens: 1024
