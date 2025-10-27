@@ -1,8 +1,10 @@
-"""Demo Autogen agent using MarkItDown and a local command executor."""
+"""Demo Autogen agent using MarkItDown and async tool + code execution flows."""
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
+from textwrap import shorten
 
 from autogen import AssistantAgent, UserProxyAgent
 from autogen.agentchat.executors import LocalCommandLineExecutor
@@ -30,29 +32,47 @@ def register_markitdown_tool(user_proxy: UserProxyAgent, assistant: AssistantAge
         "Provide a relative or absolute file path."
     )
 
-    try:
-        user_proxy.register_for_execution(
-            function_map={"convert_with_markitdown": convert_with_markitdown},
-            description_map={"convert_with_markitdown": description},
-        )
-        assistant.register_for_llm(
-            function_map={"convert_with_markitdown": convert_with_markitdown},
-            description_map={"convert_with_markitdown": description},
-        )
-    except TypeError:
-        user_proxy.register_for_execution(
-            name="convert_with_markitdown",
-            function=convert_with_markitdown,
-            description=description,
-        )
-        assistant.register_for_llm(
-            name="convert_with_markitdown",
-            function=convert_with_markitdown,
-            description=description,
-        )
+    user_proxy.register_for_execution(
+        function_map={"convert_with_markitdown": convert_with_markitdown},
+        description_map={"convert_with_markitdown": description},
+    )
+    assistant.register_for_llm(
+        function_map={"convert_with_markitdown": convert_with_markitdown},
+        description_map={"convert_with_markitdown": description},
+    )
 
 
-def build_agents() -> tuple[UserProxyAgent, AssistantAgent]:
+class AutoFeedbackCommandExecutor(LocalCommandLineExecutor):
+    """Local executor that emits short feedback messages after each run."""
+
+    def __init__(self, *args, **kwargs):  # type: ignore[override]
+        super().__init__(*args, **kwargs)
+        self.last_feedback: str | None = None
+
+    def _format_feedback(self, command: str, exit_code: int, output: str) -> str:
+        status = "succeeded" if exit_code == 0 else "failed"
+        snippet = shorten(output.strip(), width=220, placeholder="...") if output else "(no output)"
+        return (
+            f"Command `{command}` {status} with exit code {exit_code}.\n"
+            f"Output snippet:\n{snippet}"
+        )
+
+    async def aexecute(self, command: str, **kwargs):  # type: ignore[override]
+        result = await super().aexecute(command, **kwargs)
+        feedback = self._format_feedback(command, result.get("exit_code", 0), result.get("content", ""))
+        self.last_feedback = feedback
+        result.setdefault("metadata", {})["auto_feedback"] = feedback
+        return result
+
+    def execute(self, command: str, **kwargs):  # type: ignore[override]
+        result = super().execute(command, **kwargs)
+        feedback = self._format_feedback(command, result.get("exit_code", 0), result.get("content", ""))
+        self.last_feedback = feedback
+        result.setdefault("metadata", {})["auto_feedback"] = feedback
+        return result
+
+
+async def build_agents() -> tuple[UserProxyAgent, AssistantAgent]:
     hf_token = os.environ.get("HF_TOKEN")
     if not hf_token:
         raise RuntimeError("HF_TOKEN environment variable must be set.")
@@ -78,7 +98,7 @@ def build_agents() -> tuple[UserProxyAgent, AssistantAgent]:
         },
     )
 
-    executor = LocalCommandLineExecutor(work_dir=str(WORK_DIR))
+    executor = AutoFeedbackCommandExecutor(work_dir=str(WORK_DIR))
     user_proxy = UserProxyAgent(
         name="operator",
         human_input_mode="NEVER",
@@ -88,22 +108,42 @@ def build_agents() -> tuple[UserProxyAgent, AssistantAgent]:
 
     register_markitdown_tool(user_proxy, assistant)
 
+    @user_proxy.register_for_execution(name="relay_code_feedback")
+    def _relay_feedback() -> str:
+        """Return a concise summary of the previous shell command."""
+
+        return executor.last_feedback or "No feedback available."
+
+    assistant.register_for_llm(
+        name="relay_code_feedback",
+        function=_relay_feedback,
+        description=(
+            "Summarise the result of the most recent command executed by the "
+            "local shell executor."
+        ),
+    )
+
     return user_proxy, assistant
 
 
-def run_demo() -> None:
-    user_proxy, assistant = build_agents()
+async def run_demo() -> None:
+    user_proxy, assistant = await build_agents()
 
     instructions = (
-        "Use the MarkItDown tool to summarise README.md, then run 'ls' using the "
-        "code executor to list generated files."
+        "First, call the MarkItDown tool to summarise README.md. Then run 'ls' using the "
+        "code executor. After each command, use the relay_code_feedback tool to review the "
+        "execution summary."
     )
 
-    user_proxy.initiate_chat(
+    await user_proxy.a_initiate_chat(
         assistant,
         message=instructions,
     )
 
 
+def main() -> None:
+    asyncio.run(run_demo())
+
+
 if __name__ == "__main__":
-    run_demo()
+    main()
